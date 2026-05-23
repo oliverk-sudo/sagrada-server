@@ -1,5 +1,7 @@
 """
 Sagrada Família Tower Ticket Availability Server
+Token is stored as a Railway environment variable RECAPTCHA_TOKEN
+so you can update it without touching GitHub.
 """
 
 import requests
@@ -8,15 +10,14 @@ import time
 import threading
 import os
 from datetime import datetime, timedelta
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-PRODUCT_ID    = 4443
-VENUE_ID      = 1
-SALES_GROUP   = 1
-MONTHS_AHEAD  = 3
-REFRESH_MINS  = 15
+PRODUCT_ID   = 4443
+SALES_GROUP  = 1
+MONTHS_AHEAD = 3
+REFRESH_MINS = 15
 
 TOWER_SLOTS = ["14:00","14:15","14:30","14:45","15:00","15:15",
                "15:30","15:45","16:00","16:15","16:30"]
@@ -24,12 +25,19 @@ ENTRY_SLOTS = ["13:30","13:45","14:00","14:15","14:30","14:45","15:00"]
 
 CLORIAN_URL = "https://services.clorian.com/catalog/events/available"
 
-RECAPTCHA_TOKEN = "0cAFcWeA7y7ZVzYlEZaYazMRTgeTwxj6T6PTuEiHLDFZCrd58FNnhPztc-e7OhLY8PbYVeZENTfy9WAuCq3YzN21pRfHjiqZLZT0bJ5QCA2JEhTsxyNM0-0_sTsd3zoyB-uX05659i_H0ZZyxwOdobv8Ppfgcdguf4OnOonNAWNqMC1JmtiMOGqyEMJYcuGYfQisu_7ai5uUpuX4OshHmf2X63bD5Y3DX4T4OcaN25qkWulkW5uawEFCIQoNxY3bMY1dGgi9uy-B-08kGbtublidGs3e-BvFqCpSEVmOjEvoeRbYetfDim9nfYmJrXtdBBeU9qqm-ZT9S2EHEDG2ENfSyU1WgcWpEqa9tVCbnskZaUYVO4zx1c4Ooes5HZujLPsb3Elk3jTOYu2ZUdUApvvgHIIS9XHy5e1MZBVpyngeVX5nRf5rHl77QL6in0ZodMP1TPxY_mMGOhYeuXAyv4rMdUPaqI6rx0I4PQGAQ58PsdmIAhl68bfeI-Ee-7TaFvQz266h9dgIkUTJemYbCX5c2sSkI7NWkFSzY9yEZp9by6hpGljz-FCK2rXzK_3jyhb-Px3MCIfle5FrWWUgKuTJqPu1ciQp8UCO4wIjrbwmq5TpygcMFoRdCKRuRbtmQDpdnzUB0FCvbVQ6roPLz1T2Seic0GdPRd4FLFqcjiC5zHJ5BjQmA_Wy-f9XkBPerDBdwy81KG6WQJWsNtPI429GH5R9uteonD8P7ExYmhMaJYYu8u2gbWsaVRgoNyl9ESUhWmq_853rdw6P6YLyMGe_Yu43qsS-lSRbOdLwe9ESd0fDVIrecTCiqcJHTif-lwXFPS7l4fbmtbSvPH7N9Ynnt5kzTJdF9XYNGwtt2t7S6vIZWUgTO_hHDeQgf9Hq-hN0p-_vY4EOYOc3jL77O6tGi7BQzfWZGHhthWsXEdMvh88hHSMGG7lgEUxhBcKQYEloQCQL_T3RzsBacA3Wwu-URYFA6bk9AvopEFm_FTV6825Aj7l5DeppqYc3e6i0P6tRJZbaLvOh7u3zQgPTW_xMmAKeGh2_rf2sN--1l8b2RYuM-ljdTaH6b60-y-12FKXBI2aNPpwoXHfyxbdj2R0lgImjrsQHYIeZOJM0wEaSpOAUfPh9wFGuQ"
+# Token is read from environment variable — update it in Railway dashboard
+# without needing to change any code or redeploy
+def get_token():
+    return os.environ.get("RECAPTCHA_TOKEN", "")
+
+# We try both venue IDs since the site uses them inconsistently
+VENUE_IDS = [3, 1]
 
 # ─── STATE ───────────────────────────────────────────────────────────────────
 availability_cache = {}
 last_updated = None
 token_expired = False
+working_venue_id = 3  # will be updated when we find the working one
 
 # ─── FETCH LOGIC ─────────────────────────────────────────────────────────────
 def get_dates_to_check():
@@ -41,25 +49,13 @@ def get_dates_to_check():
     return dates
 
 
-def parse_time(start_datetime):
-    """
-    Extract HH:MM from a datetime string like '2026-06-21T13:15:00+02:00'
-    The times are in Barcelona local time so we just read HH:MM directly.
-    """
-    try:
-        # Format: 2026-06-21T13:15:00+02:00 — take chars 11-16
-        return start_datetime[11:16]
-    except Exception:
-        return None
-
-
-def fetch_date(date_str):
+def fetch_date(date_str, venue_id):
     global token_expired
     params = {
         "productId":     PRODUCT_ID,
         "salesGroupId":  SALES_GROUP,
-        "venueId":       VENUE_ID,
-        "recaptcha":     RECAPTCHA_TOKEN,
+        "venueId":       venue_id,
+        "recaptcha":     get_token(),
         "startDateFrom": date_str,
         "startDateTo":   date_str,
     }
@@ -70,67 +66,71 @@ def fetch_date(date_str):
         "Referer":    "https://tickets.sagradafamilia.org/",
     }
     try:
-        response = requests.get(CLORIAN_URL, params=params, headers=headers, timeout=10)
-
-        if response.status_code in (401, 403):
+        res = requests.get(CLORIAN_URL, params=params, headers=headers, timeout=10)
+        if res.status_code in (401, 403):
             token_expired = True
-            print(f"  ⚠ Token expired (HTTP {response.status_code}) for {date_str}")
+            print(f"  ⚠ Token expired (HTTP {res.status_code}) for {date_str}")
             return None
-
-        response.raise_for_status()
+        res.raise_for_status()
         token_expired = False
-        events = response.json()
-
-        # API returns a list of event objects directly
+        events = res.json()
         if not isinstance(events, list):
             events = events.get("events") or events.get("data") or events.get("items") or []
 
         tower = {t: 0 for t in TOWER_SLOTS}
         entry = {t: 0 for t in ENTRY_SLOTS}
-
         for event in events:
-            # Get the start datetime — field is 'startDatetime' per the response
-            start = (event.get("startDatetime") or
-                     event.get("startDate") or
-                     event.get("start") or "")
-
-            time_str = parse_time(start)
+            start = (event.get("startDatetime") or event.get("startDate") or event.get("start") or "")
+            time_str = start[11:16] if len(start) >= 16 else None
             if not time_str:
                 continue
-
-            # The key field is 'totalAvailability'
-            avail = (event.get("totalAvailability") or
-                     event.get("availableTickets") or
-                     event.get("available") or 0)
-
-            print(f"    {date_str} {time_str} → {avail} available")
-
+            avail = (event.get("totalAvailability") or event.get("availableTickets") or event.get("available") or 0)
             if time_str in TOWER_SLOTS:
                 tower[time_str] = avail
             if time_str in ENTRY_SLOTS:
                 entry[time_str] = avail
 
         return {"tower": tower, "entry": entry, "live": True}
-
     except Exception as e:
-        print(f"  ✗ Error fetching {date_str}: {e}")
+        print(f"  ✗ Error fetching {date_str} (venue {venue_id}): {e}")
         return None
+
+
+def fetch_date_any_venue(date_str):
+    global working_venue_id
+    # Try the last working venue first, then the other
+    venues = [working_venue_id] + [v for v in VENUE_IDS if v != working_venue_id]
+    for venue_id in venues:
+        result = fetch_date(date_str, venue_id)
+        if result:
+            working_venue_id = venue_id
+            return result
+        if token_expired:
+            return None  # no point trying other venues if token is dead
+    return None
 
 
 def refresh_all():
     global availability_cache, last_updated
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Starting refresh...")
+    if not get_token():
+        print("⚠ No RECAPTCHA_TOKEN set — please add it in Railway Variables")
+        return
+
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Starting refresh (venue {working_venue_id})...")
     dates = get_dates_to_check()
     new_cache = {}
     success = 0
 
     for date_str in dates:
-        result = fetch_date(date_str)
+        result = fetch_date_any_venue(date_str)
         if result:
             new_cache[date_str] = result
             success += 1
         elif date_str in availability_cache:
             new_cache[date_str] = availability_cache[date_str]
+        if token_expired:
+            print("  Token expired — stopping refresh early")
+            break
         time.sleep(0.4)
 
     availability_cache = new_cache
@@ -160,13 +160,14 @@ def home():
         "status":        "running",
         "last_updated":  last_updated,
         "dates_cached":  len(availability_cache),
+        "token_set":     bool(get_token()),
         "token_expired": token_expired,
         "message":       "Sagrada Familia Availability Server is live!"
     })
 
 
 @app.route("/availability")
-def get_all_availability():
+def get_all():
     return jsonify({
         "updated":       last_updated,
         "token_expired": token_expired,
@@ -175,7 +176,7 @@ def get_all_availability():
 
 
 @app.route("/availability/<date_str>")
-def get_date_availability(date_str):
+def get_date(date_str):
     if date_str in availability_cache:
         return jsonify(availability_cache[date_str])
     return jsonify({"error": "Date not found"}), 404
@@ -203,3 +204,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     print(f"Server starting on port {port}...")
     app.run(host="0.0.0.0", port=port)
+
