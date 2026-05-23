@@ -112,7 +112,7 @@ def fetch_all_with_playwright():
 
             # Visit the ticket page — this loads the calendar and triggers API calls
             print("  Opening ticket page...")
-            page.goto(TICKET_URL, wait_until="networkidle", timeout=30000)
+            page.goto(TICKET_URL, wait_until="domcontentloaded", timeout=60000)
             print("  Page loaded — calendar should be visible")
 
             # Wait for initial API calls to complete
