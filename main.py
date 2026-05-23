@@ -11,63 +11,74 @@ import requests
 import json
 import time
 import threading
+import os
 from datetime import datetime, timedelta
 from flask import Flask, jsonify
 from flask_cors import CORS
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 PRODUCT_ID    = 4443          # Sagrada Familia with Towers
-VENUE_ID      = 3             # The basilica
+VENUE_ID      = 1             # Correct venue ID from live URL
 SALES_GROUP   = 1
-MONTHS_AHEAD  = 3             # How many months to check
-REFRESH_MINS  = 15            # How often to fetch fresh data
+MONTHS_AHEAD  = 3
+REFRESH_MINS  = 15
 
-# The time slots you care about
 TOWER_SLOTS = ["14:00","14:15","14:30","14:45","15:00","15:15",
                "15:30","15:45","16:00","16:15","16:30"]
 ENTRY_SLOTS = ["13:30","13:45","14:00","14:15","14:30","14:45","15:00"]
 
 CLORIAN_URL = "https://services.clorian.com/catalog/events/available"
 
+# Recaptcha token — paste a fresh one here when it expires.
+# Get it by: going to tickets.sagradafamilia.org, picking a date,
+# opening DevTools Network tab, copying the recaptcha= value from
+# the available?productId=4443 request URL.
+RECAPTCHA_TOKEN = "0cAFcWeA7y7ZVzYlEZaYazMRTgeTwxj6T6PTuEiHLDFZCrd58FNnhPztc-e7OhLY8PbYVeZENTfy9WAuCq3YzN21pRfHjiqZLZT0bJ5QCA2JEhTsxyNM0-0_sTsd3zoyB-uX05659i_H0ZZyxwOdobv8Ppfgcdguf4OnOonNAWNqMC1JmtiMOGqyEMJYcuGYfQisu_7ai5uUpuX4OshHmf2X63bD5Y3DX4T4OcaN25qkWulkW5uawEFCIQoNxY3bMY1dGgi9uy-B-08kGbtublidGs3e-BvFqCpSEVmOjEvoeRbYetfDim9nfYmJrXtdBBeU9qqm-ZT9S2EHEDG2ENfSyU1WgcWpEqa9tVCbnskZaUYVO4zx1c4Ooes5HZujLPsb3Elk3jTOYu2ZUdUApvvgHIIS9XHy5e1MZBVpyngeVX5nRf5rHl77QL6in0ZodMP1TPxY_mMGOhYeuXAyv4rMdUPaqI6rx0I4PQGAQ58PsdmIAhl68bfeI-Ee-7TaFvQz266h9dgIkUTJemYbCX5c2sSkI7NWkFSzY9yEZp9by6hpGljz-FCK2rXzK_3jyhb-Px3MCIfle5FrWWUgKuTJqPu1ciQp8UCO4wIjrbwmq5TpygcMFoRdCKRuRbtmQDpdnzUB0FCvbVQ6roPLz1T2Seic0GdPRd4FLFqcjiC5zHJ5BjQmA_Wy-f9XkBPerDBdwy81KG6WQJWsNtPI429GH5R9uteonD8P7ExYmhMaJYYu8u2gbWsaVRgoNyl9ESUhWmq_853rdw6P6YLyMGe_Yu43qsS-lSRbOdLwe9ESd0fDVIrecTCiqcJHTif-lwXFPS7l4fbmtbSvPH7N9Ynnt5kzTJdF9XYNGwtt2t7S6vIZWUgTO_hHDeQgf9Hq-hN0p-_vY4EOYOc3jL77O6tGi7BQzfWZGHhthWsXEdMvh88hHSMGG7lgEUxhBcKQYEloQCQL_T3RzsBacA3Wwu-URYFA6bk9AvopEFm_FTV6825Aj7l5DeppqYc3e6i0P6tRJZbaLvOh7u3zQgPTW_xMmAKeGh2_rf2sN--1l8b2RYuM-ljdTaH6b60-y-12FKXBI2aNPpwoXHfyxbdj2R0lgImjrsQHYIeZOJM0wEaSpOAUfPh9wFGuQ"
+
 # ─── STATE ───────────────────────────────────────────────────────────────────
-# This dictionary holds all the fetched data in memory
 availability_cache = {}
 last_updated = None
+token_expired = False
 
 # ─── FETCH LOGIC ─────────────────────────────────────────────────────────────
 def get_dates_to_check():
-    """Returns a list of date strings for the next MONTHS_AHEAD months."""
     dates = []
     today = datetime.today()
     for offset in range(MONTHS_AHEAD * 31):
         d = today + timedelta(days=offset)
-        if (d - today).days > MONTHS_AHEAD * 31:
-            break
         dates.append(d.strftime("%Y-%m-%d"))
     return dates
 
 
 def fetch_date(date_str):
-    """Fetches availability for a single date from Clorian."""
+    global token_expired
     params = {
         "productId":     PRODUCT_ID,
         "salesGroupId":  SALES_GROUP,
         "venueId":       VENUE_ID,
+        "recaptcha":     RECAPTCHA_TOKEN,
         "startDateFrom": date_str,
         "startDateTo":   date_str,
     }
     headers = {
         "Accept":     "application/json",
-        "User-Agent": "Mozilla/5.0 (compatible; AvailabilityChecker/1.0)",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Origin":     "https://tickets.sagradafamilia.org",
         "Referer":    "https://tickets.sagradafamilia.org/",
     }
     try:
         response = requests.get(CLORIAN_URL, params=params, headers=headers, timeout=10)
+
+        # 401/403 usually means the token expired
+        if response.status_code in (401, 403):
+            token_expired = True
+            print(f"  ⚠ Token may have expired (HTTP {response.status_code})")
+            return None
+
         response.raise_for_status()
+        token_expired = False
         data = response.json()
 
-        # Clorian may return a list or wrap it in a key
         events = data if isinstance(data, list) else (
             data.get("events") or data.get("data") or data.get("items") or []
         )
@@ -79,7 +90,7 @@ def fetch_date(date_str):
             start = event.get("startDate") or event.get("start") or ""
             if not start.startswith(date_str):
                 continue
-            time_str = start[11:16]  # e.g. "14:00"
+            time_str = start[11:16]
             avail = (
                 event.get("availableTickets") or
                 event.get("available") or
@@ -98,10 +109,8 @@ def fetch_date(date_str):
 
 
 def refresh_all():
-    """Fetches availability for all upcoming dates and updates the cache."""
     global availability_cache, last_updated
-
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Starting availability refresh...")
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Starting refresh...")
     dates = get_dates_to_check()
     new_cache = {}
     success = 0
@@ -111,25 +120,20 @@ def refresh_all():
         if result:
             new_cache[date_str] = result
             success += 1
-        else:
-            # Keep old data if we have it
-            if date_str in availability_cache:
-                new_cache[date_str] = availability_cache[date_str]
-        # Be polite — small delay between requests so we don't hammer the server
-        time.sleep(0.5)
+        elif date_str in availability_cache:
+            new_cache[date_str] = availability_cache[date_str]
+        time.sleep(0.4)  # be polite to the server
 
     availability_cache = new_cache
     last_updated = datetime.now().isoformat()
 
-    # Save to disk as backup
     with open("cache.json", "w") as f:
         json.dump({"updated": last_updated, "data": availability_cache}, f)
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Done — {success}/{len(dates)} dates fetched successfully")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Done — {success}/{len(dates)} dates fetched")
 
 
 def background_refresh_loop():
-    """Runs in a background thread, refreshing data every REFRESH_MINS minutes."""
     while True:
         refresh_all()
         print(f"  Next refresh in {REFRESH_MINS} minutes...")
@@ -138,32 +142,31 @@ def background_refresh_loop():
 
 # ─── WEB SERVER ───────────────────────────────────────────────────────────────
 app = Flask(__name__)
-CORS(app)  # This allows the dashboard to call this server from any browser
+CORS(app)
 
 
 @app.route("/")
 def home():
-    """Simple status page so you can check the server is running."""
     return jsonify({
-        "status":       "running",
-        "last_updated": last_updated,
-        "dates_cached": len(availability_cache),
-        "message":      "Sagrada Familia Availability Server is live!"
+        "status":        "running",
+        "last_updated":  last_updated,
+        "dates_cached":  len(availability_cache),
+        "token_expired": token_expired,
+        "message":       "Sagrada Familia Availability Server is live!"
     })
 
 
 @app.route("/availability")
 def get_all_availability():
-    """Returns all cached availability data."""
     return jsonify({
-        "updated": last_updated,
-        "data":    availability_cache
+        "updated":       last_updated,
+        "token_expired": token_expired,
+        "data":          availability_cache
     })
 
 
 @app.route("/availability/<date_str>")
 def get_date_availability(date_str):
-    """Returns availability for a specific date, e.g. /availability/2026-07-15"""
     if date_str in availability_cache:
         return jsonify(availability_cache[date_str])
     return jsonify({"error": "Date not found"}), 404
@@ -171,13 +174,11 @@ def get_date_availability(date_str):
 
 @app.route("/health")
 def health():
-    """Railway uses this to check the server is alive."""
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "token_expired": token_expired})
 
 
 # ─── STARTUP ──────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Try to load cached data from disk on startup (so we have something immediately)
     try:
         with open("cache.json") as f:
             saved = json.load(f)
@@ -185,14 +186,11 @@ if __name__ == "__main__":
             last_updated = saved.get("updated")
             print(f"Loaded {len(availability_cache)} dates from disk cache")
     except FileNotFoundError:
-        print("No disk cache found — will fetch fresh data now")
+        print("No disk cache — fetching fresh data now")
 
-    # Start the background refresh thread
     thread = threading.Thread(target=background_refresh_loop, daemon=True)
     thread.start()
 
-    # Start the web server (Railway sets PORT automatically)
-    import os
     port = int(os.environ.get("PORT", 8080))
     print(f"Server starting on port {port}...")
     app.run(host="0.0.0.0", port=port)
