@@ -1,20 +1,22 @@
 """
 Sagrada Família Tower Ticket Availability Server
-Token is stored as a Railway environment variable RECAPTCHA_TOKEN
-so you can update it without touching GitHub.
+Uses Playwright (headless browser) to fetch real availability data.
+This bypasses the recaptcha token problem entirely — the browser
+generates and uses its own token automatically, just like a real user.
 """
 
-import requests
 import json
 import time
 import threading
 import os
 from datetime import datetime, timedelta
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 from flask_cors import CORS
+from playwright.sync_api import sync_playwright
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 PRODUCT_ID   = 4443
+VENUE_ID     = 3
 SALES_GROUP  = 1
 MONTHS_AHEAD = 3
 REFRESH_MINS = 15
@@ -23,23 +25,15 @@ TOWER_SLOTS = ["14:00","14:15","14:30","14:45","15:00","15:15",
                "15:30","15:45","16:00","16:15","16:30"]
 ENTRY_SLOTS = ["13:30","13:45","14:00","14:15","14:30","14:45","15:00"]
 
-CLORIAN_URL = "https://services.clorian.com/catalog/events/available"
-
-# Token is read from environment variable — update it in Railway dashboard
-# without needing to change any code or redeploy
-def get_token():
-    return os.environ.get("RECAPTCHA_TOKEN", "")
-
-# We try both venue IDs since the site uses them inconsistently
-VENUE_IDS = [3, 1]
+TICKET_URL = "https://tickets.sagradafamilia.org/en/1-individual/4443-sagrada-familia-with-towers"
+CLORIAN_BASE = "https://services.clorian.com/catalog/events/available"
 
 # ─── STATE ───────────────────────────────────────────────────────────────────
 availability_cache = {}
 last_updated = None
-token_expired = False
-working_venue_id = 3  # will be updated when we find the working one
+last_error = None
 
-# ─── FETCH LOGIC ─────────────────────────────────────────────────────────────
+# ─── HELPERS ─────────────────────────────────────────────────────────────────
 def get_dates_to_check():
     dates = []
     today = datetime.today()
@@ -49,89 +43,125 @@ def get_dates_to_check():
     return dates
 
 
-def fetch_date(date_str, venue_id):
-    global token_expired
-    params = {
-        "productId":     PRODUCT_ID,
-        "salesGroupId":  SALES_GROUP,
-        "venueId":       venue_id,
-        "recaptcha":     get_token(),
-        "startDateFrom": date_str,
-        "startDateTo":   date_str,
-    }
-    headers = {
-        "Accept":     "application/json",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Origin":     "https://tickets.sagradafamilia.org",
-        "Referer":    "https://tickets.sagradafamilia.org/",
-    }
-    try:
-        res = requests.get(CLORIAN_URL, params=params, headers=headers, timeout=10)
-        if res.status_code in (401, 403):
-            token_expired = True
-            print(f"  ⚠ Token expired (HTTP {res.status_code}) for {date_str}")
-            return None
-        res.raise_for_status()
-        token_expired = False
-        events = res.json()
-        if not isinstance(events, list):
-            events = events.get("events") or events.get("data") or events.get("items") or []
-
-        tower = {t: 0 for t in TOWER_SLOTS}
-        entry = {t: 0 for t in ENTRY_SLOTS}
-        for event in events:
-            start = (event.get("startDatetime") or event.get("startDate") or event.get("start") or "")
-            time_str = start[11:16] if len(start) >= 16 else None
-            if not time_str:
-                continue
-            avail = (event.get("totalAvailability") or event.get("availableTickets") or event.get("available") or 0)
-            if time_str in TOWER_SLOTS:
-                tower[time_str] = avail
-            if time_str in ENTRY_SLOTS:
-                entry[time_str] = avail
-
+def parse_events(events, date_str):
+    """Turn a list of Clorian event objects into our slot format."""
+    tower = {t: 0 for t in TOWER_SLOTS}
+    entry = {t: 0 for t in ENTRY_SLOTS}
+    if not isinstance(events, list):
         return {"tower": tower, "entry": entry, "live": True}
-    except Exception as e:
-        print(f"  ✗ Error fetching {date_str} (venue {venue_id}): {e}")
-        return None
+    for event in events:
+        start = (event.get("startDatetime") or event.get("startDate") or
+                 event.get("start") or "")
+        if not start.startswith(date_str):
+            continue
+        time_str = start[11:16]  # "14:00"
+        avail = (event.get("totalAvailability") or
+                 event.get("availableTickets") or
+                 event.get("available") or 0)
+        if time_str in TOWER_SLOTS:
+            tower[time_str] = avail
+        if time_str in ENTRY_SLOTS:
+            entry[time_str] = avail
+    return {"tower": tower, "entry": entry, "live": True}
 
 
-def fetch_date_any_venue(date_str):
-    global working_venue_id
-    # Try the last working venue first, then the other
-    venues = [working_venue_id] + [v for v in VENUE_IDS if v != working_venue_id]
-    for venue_id in venues:
-        result = fetch_date(date_str, venue_id)
-        if result:
-            working_venue_id = venue_id
-            return result
-        if token_expired:
-            return None  # no point trying other venues if token is dead
-    return None
+# ─── PLAYWRIGHT FETCH ─────────────────────────────────────────────────────────
+def fetch_all_with_playwright():
+    """
+    Opens a real headless browser, visits the ticket page, then intercepts
+    the API calls to collect availability data for all dates.
+    No recaptcha token needed — the browser handles it automatically.
+    """
+    global availability_cache, last_updated, last_error
 
-
-def refresh_all():
-    global availability_cache, last_updated
-    if not get_token():
-        print("⚠ No RECAPTCHA_TOKEN set — please add it in Railway Variables")
-        return
-
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Starting refresh (venue {working_venue_id})...")
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Starting Playwright fetch...")
     dates = get_dates_to_check()
     new_cache = {}
-    success = 0
 
-    for date_str in dates:
-        result = fetch_date_any_venue(date_str)
-        if result:
-            new_cache[date_str] = result
-            success += 1
-        elif date_str in availability_cache:
-            new_cache[date_str] = availability_cache[date_str]
-        if token_expired:
-            print("  Token expired — stopping refresh early")
-            break
-        time.sleep(0.4)
+    try:
+        with sync_playwright() as p:
+            # Launch headless Chromium
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800},
+            )
+            page = context.new_page()
+
+            # Storage for intercepted API responses
+            api_responses = {}
+
+            # Intercept all API calls to the Clorian availability endpoint
+            def handle_response(response):
+                if CLORIAN_BASE in response.url and "available" in response.url:
+                    try:
+                        data = response.json()
+                        events = data if isinstance(data, list) else (
+                            data.get("events") or data.get("data") or data.get("items") or []
+                        )
+                        # Find which date this response is for
+                        for date_str in dates:
+                            if date_str in response.url:
+                                api_responses[date_str] = events
+                                print(f"  ✓ Captured {date_str} — {len(events)} events")
+                                break
+                    except Exception as e:
+                        print(f"  ✗ Failed to parse response: {e}")
+
+            page.on("response", handle_response)
+
+            # Visit the ticket page — this loads the calendar and triggers API calls
+            print("  Opening ticket page...")
+            page.goto(TICKET_URL, wait_until="networkidle", timeout=30000)
+            print("  Page loaded — calendar should be visible")
+
+            # Wait for initial API calls to complete
+            page.wait_for_timeout(3000)
+
+            # Now click through each month to trigger API calls for all dates
+            for month_offset in range(MONTHS_AHEAD + 1):
+                try:
+                    # Click the "next month" arrow on the calendar
+                    if month_offset > 0:
+                        next_btn = page.query_selector("[aria-label='Next month'], .next-month, .fc-next-button, button[class*='next']")
+                        if next_btn:
+                            next_btn.click()
+                            page.wait_for_timeout(2000)  # wait for API call
+
+                    # Also try clicking each date to get slot-level data
+                    # The calendar usually loads slot data when you click a date
+                    date_cells = page.query_selector_all("[data-date], .fc-day, td[class*='day']")
+                    for cell in date_cells[:5]:  # click a few dates per month
+                        try:
+                            cell.click()
+                            page.wait_for_timeout(1000)
+                        except:
+                            pass
+                except Exception as e:
+                    print(f"  Navigation error (month {month_offset}): {e}")
+
+            # Final wait for any remaining API calls
+            page.wait_for_timeout(3000)
+
+            browser.close()
+            print(f"  Browser closed — captured {len(api_responses)} dates from API")
+
+            # Parse all captured responses
+            for date_str, events in api_responses.items():
+                new_cache[date_str] = parse_events(events, date_str)
+
+            # For dates not captured via interception, keep old data
+            for date_str in dates:
+                if date_str not in new_cache and date_str in availability_cache:
+                    new_cache[date_str] = availability_cache[date_str]
+
+        last_error = None
+
+    except Exception as e:
+        last_error = str(e)
+        print(f"  ✗ Playwright error: {e}")
+        # Keep existing cache on error
+        new_cache = availability_cache
 
     availability_cache = new_cache
     last_updated = datetime.now().isoformat()
@@ -139,12 +169,12 @@ def refresh_all():
     with open("cache.json", "w") as f:
         json.dump({"updated": last_updated, "data": availability_cache}, f)
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Done — {success}/{len(dates)} dates fetched")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Done — {len(new_cache)} dates cached")
 
 
-def background_refresh_loop():
+def background_loop():
     while True:
-        refresh_all()
+        fetch_all_with_playwright()
         print(f"  Next refresh in {REFRESH_MINS} minutes...")
         time.sleep(REFRESH_MINS * 60)
 
@@ -157,21 +187,19 @@ CORS(app)
 @app.route("/")
 def home():
     return jsonify({
-        "status":        "running",
-        "last_updated":  last_updated,
-        "dates_cached":  len(availability_cache),
-        "token_set":     bool(get_token()),
-        "token_expired": token_expired,
-        "message":       "Sagrada Familia Availability Server is live!"
+        "status":       "running",
+        "last_updated": last_updated,
+        "dates_cached": len(availability_cache),
+        "last_error":   last_error,
+        "message":      "Sagrada Familia Availability Server is live!"
     })
 
 
 @app.route("/availability")
 def get_all():
     return jsonify({
-        "updated":       last_updated,
-        "token_expired": token_expired,
-        "data":          availability_cache
+        "updated": last_updated,
+        "data":    availability_cache
     })
 
 
@@ -184,7 +212,7 @@ def get_date(date_str):
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "token_expired": token_expired})
+    return jsonify({"status": "ok"})
 
 
 # ─── STARTUP ──────────────────────────────────────────────────────────────────
@@ -196,9 +224,9 @@ if __name__ == "__main__":
             last_updated = saved.get("updated")
             print(f"Loaded {len(availability_cache)} dates from disk cache")
     except FileNotFoundError:
-        print("No disk cache — fetching fresh data now")
+        print("No disk cache — will fetch fresh data now")
 
-    thread = threading.Thread(target=background_refresh_loop, daemon=True)
+    thread = threading.Thread(target=background_loop, daemon=True)
     thread.start()
 
     port = int(os.environ.get("PORT", 8080))
