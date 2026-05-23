@@ -1,8 +1,7 @@
 """
 Sagrada Família Tower Ticket Availability Server
-Uses Playwright (headless browser) to fetch real availability data.
-This bypasses the recaptcha token problem entirely — the browser
-generates and uses its own token automatically, just like a real user.
+Uses Playwright to load the ticket page (getting valid session cookies),
+then makes direct API calls for each date using those cookies.
 """
 
 import json
@@ -25,7 +24,7 @@ TOWER_SLOTS = ["14:00","14:15","14:30","14:45","15:00","15:15",
                "15:30","15:45","16:00","16:15","16:30"]
 ENTRY_SLOTS = ["13:30","13:45","14:00","14:15","14:30","14:45","15:00"]
 
-TICKET_URL = "https://tickets.sagradafamilia.org/en/1-individual/4443-sagrada-familia-with-towers"
+TICKET_URL   = "https://tickets.sagradafamilia.org/en/1-individual/4443-sagrada-familia-with-towers"
 CLORIAN_BASE = "https://services.clorian.com/catalog/events/available"
 
 # ─── STATE ───────────────────────────────────────────────────────────────────
@@ -44,7 +43,6 @@ def get_dates_to_check():
 
 
 def parse_events(events, date_str):
-    """Turn a list of Clorian event objects into our slot format."""
     tower = {t: 0 for t in TOWER_SLOTS}
     entry = {t: 0 for t in ENTRY_SLOTS}
     if not isinstance(events, list):
@@ -52,9 +50,9 @@ def parse_events(events, date_str):
     for event in events:
         start = (event.get("startDatetime") or event.get("startDate") or
                  event.get("start") or "")
-        if not start.startswith(date_str):
+        time_str = start[11:16] if len(start) >= 16 else None
+        if not time_str:
             continue
-        time_str = start[11:16]  # "14:00"
         avail = (event.get("totalAvailability") or
                  event.get("availableTickets") or
                  event.get("available") or 0)
@@ -65,13 +63,8 @@ def parse_events(events, date_str):
     return {"tower": tower, "entry": entry, "live": True}
 
 
-# ─── PLAYWRIGHT FETCH ─────────────────────────────────────────────────────────
+# ─── MAIN FETCH ──────────────────────────────────────────────────────────────
 def fetch_all_with_playwright():
-    """
-    Opens a real headless browser, visits the ticket page, then intercepts
-    the API calls to collect availability data for all dates.
-    No recaptcha token needed — the browser handles it automatically.
-    """
     global availability_cache, last_updated, last_error
 
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Starting Playwright fetch...")
@@ -80,7 +73,6 @@ def fetch_all_with_playwright():
 
     try:
         with sync_playwright() as p:
-            # Launch headless Chromium
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -88,80 +80,102 @@ def fetch_all_with_playwright():
             )
             page = context.new_page()
 
-            # Storage for intercepted API responses
-            api_responses = {}
+            # Step 1: visit the ticket page to get session cookies + recaptcha token
+            print("  Loading ticket page to get session...")
+            captured_token = None
+            captured_venue = VENUE_ID
 
-            # Intercept all API calls to the Clorian availability endpoint
-            def handle_response(response):
-                if CLORIAN_BASE in response.url and "available" in response.url:
-                    try:
-                        data = response.json()
-                        events = data if isinstance(data, list) else (
-                            data.get("events") or data.get("data") or data.get("items") or []
-                        )
-                        # Find which date this response is for
-                        for date_str in dates:
-                            if date_str in response.url:
-                                api_responses[date_str] = events
-                                print(f"  ✓ Captured {date_str} — {len(events)} events")
-                                break
-                    except Exception as e:
-                        print(f"  ✗ Failed to parse response: {e}")
+            def on_request(request):
+                nonlocal captured_token, captured_venue
+                if CLORIAN_BASE in request.url and "recaptcha=" in request.url:
+                    # Extract token from the URL
+                    for part in request.url.split("&"):
+                        if part.startswith("recaptcha="):
+                            captured_token = part[len("recaptcha="):]
+                        if part.startswith("venueId="):
+                            captured_venue = part[len("venueId="):]
 
-            page.on("response", handle_response)
+            page.on("request", on_request)
 
-            # Visit the ticket page — this loads the calendar and triggers API calls
-            print("  Opening ticket page...")
-            page.goto(TICKET_URL, wait_until="domcontentloaded", timeout=60000)
-            print("  Page loaded — calendar should be visible")
+            try:
+                page.goto(TICKET_URL, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(5000)  # wait for API calls to fire
+            except Exception as e:
+                print(f"  Page load warning: {e}")
 
-            # Wait for initial API calls to complete
-            page.wait_for_timeout(3000)
+            if captured_token:
+                print(f"  ✓ Captured token from page (venue {captured_venue})")
+            else:
+                print("  ⚠ No token captured — will try with cookies only")
 
-            # Now click through each month to trigger API calls for all dates
-            for month_offset in range(MONTHS_AHEAD + 1):
+            # Step 2: use the page's fetch() to make API calls for each date
+            # This runs JavaScript inside the browser, using its existing session
+            print(f"  Fetching {len(dates)} dates via browser API calls...")
+            success = 0
+
+            for date_str in dates:
                 try:
-                    # Click the "next month" arrow on the calendar
-                    if month_offset > 0:
-                        next_btn = page.query_selector("[aria-label='Next month'], .next-month, .fc-next-button, button[class*='next']")
-                        if next_btn:
-                            next_btn.click()
-                            page.wait_for_timeout(2000)  # wait for API call
+                    # Build URL with or without token
+                    if captured_token:
+                        url = (f"{CLORIAN_BASE}?productId={PRODUCT_ID}"
+                               f"&salesGroupId={SALES_GROUP}&venueId={captured_venue}"
+                               f"&recaptcha={captured_token}"
+                               f"&startDateFrom={date_str}&startDateTo={date_str}")
+                    else:
+                        url = (f"{CLORIAN_BASE}?productId={PRODUCT_ID}"
+                               f"&salesGroupId={SALES_GROUP}&venueId={VENUE_ID}"
+                               f"&startDateFrom={date_str}&startDateTo={date_str}")
 
-                    # Also try clicking each date to get slot-level data
-                    # The calendar usually loads slot data when you click a date
-                    date_cells = page.query_selector_all("[data-date], .fc-day, td[class*='day']")
-                    for cell in date_cells[:5]:  # click a few dates per month
-                        try:
-                            cell.click()
-                            page.wait_for_timeout(1000)
-                        except:
-                            pass
+                    # Execute fetch inside the browser (uses browser's cookies/session)
+                    result = page.evaluate(f"""
+                        async () => {{
+                            try {{
+                                const res = await fetch("{url}", {{
+                                    headers: {{
+                                        "Accept": "application/json",
+                                        "Origin": "https://tickets.sagradafamilia.org",
+                                        "Referer": "https://tickets.sagradafamilia.org/"
+                                    }}
+                                }});
+                                if (!res.ok) return {{ error: res.status }};
+                                return await res.json();
+                            }} catch(e) {{
+                                return {{ error: e.message }};
+                            }}
+                        }}
+                    """)
+
+                    if isinstance(result, dict) and "error" in result:
+                        print(f"  ✗ {date_str}: {result['error']}")
+                        continue
+
+                    events = result if isinstance(result, list) else (
+                        result.get("events") or result.get("data") or result.get("items") or []
+                    )
+                    parsed = parse_events(events, date_str)
+                    new_cache[date_str] = parsed
+                    success += 1
+                    if success % 10 == 0:
+                        print(f"  ... {success} dates fetched")
+
+                    time.sleep(0.3)
+
                 except Exception as e:
-                    print(f"  Navigation error (month {month_offset}): {e}")
-
-            # Final wait for any remaining API calls
-            page.wait_for_timeout(3000)
+                    print(f"  ✗ {date_str}: {e}")
 
             browser.close()
-            print(f"  Browser closed — captured {len(api_responses)} dates from API")
-
-            # Parse all captured responses
-            for date_str, events in api_responses.items():
-                new_cache[date_str] = parse_events(events, date_str)
-
-            # For dates not captured via interception, keep old data
-            for date_str in dates:
-                if date_str not in new_cache and date_str in availability_cache:
-                    new_cache[date_str] = availability_cache[date_str]
-
-        last_error = None
+            print(f"  Browser closed — {success}/{len(dates)} dates fetched")
+            last_error = None
 
     except Exception as e:
         last_error = str(e)
         print(f"  ✗ Playwright error: {e}")
-        # Keep existing cache on error
-        new_cache = availability_cache
+        new_cache = availability_cache  # keep existing on error
+
+    # Keep old data for any dates we didn't get
+    for date_str in dates:
+        if date_str not in new_cache and date_str in availability_cache:
+            new_cache[date_str] = availability_cache[date_str]
 
     availability_cache = new_cache
     last_updated = datetime.now().isoformat()
