@@ -1,10 +1,5 @@
 """
 Sagrada Família Tower Ticket Availability Server
-------------------------------------------------
-- Fetches live availability from the Clorian ticketing API every 15 minutes
-- Stores results in memory (and a local JSON file as backup)
-- Serves results via a simple HTTP API that the dashboard can call
-- Runs forever on a free Railway server
 """
 
 import requests
@@ -17,8 +12,8 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-PRODUCT_ID    = 4443          # Sagrada Familia with Towers
-VENUE_ID      = 1             # Correct venue ID from live URL
+PRODUCT_ID    = 4443
+VENUE_ID      = 1
 SALES_GROUP   = 1
 MONTHS_AHEAD  = 3
 REFRESH_MINS  = 15
@@ -29,10 +24,6 @@ ENTRY_SLOTS = ["13:30","13:45","14:00","14:15","14:30","14:45","15:00"]
 
 CLORIAN_URL = "https://services.clorian.com/catalog/events/available"
 
-# Recaptcha token — paste a fresh one here when it expires.
-# Get it by: going to tickets.sagradafamilia.org, picking a date,
-# opening DevTools Network tab, copying the recaptcha= value from
-# the available?productId=4443 request URL.
 RECAPTCHA_TOKEN = "0cAFcWeA7y7ZVzYlEZaYazMRTgeTwxj6T6PTuEiHLDFZCrd58FNnhPztc-e7OhLY8PbYVeZENTfy9WAuCq3YzN21pRfHjiqZLZT0bJ5QCA2JEhTsxyNM0-0_sTsd3zoyB-uX05659i_H0ZZyxwOdobv8Ppfgcdguf4OnOonNAWNqMC1JmtiMOGqyEMJYcuGYfQisu_7ai5uUpuX4OshHmf2X63bD5Y3DX4T4OcaN25qkWulkW5uawEFCIQoNxY3bMY1dGgi9uy-B-08kGbtublidGs3e-BvFqCpSEVmOjEvoeRbYetfDim9nfYmJrXtdBBeU9qqm-ZT9S2EHEDG2ENfSyU1WgcWpEqa9tVCbnskZaUYVO4zx1c4Ooes5HZujLPsb3Elk3jTOYu2ZUdUApvvgHIIS9XHy5e1MZBVpyngeVX5nRf5rHl77QL6in0ZodMP1TPxY_mMGOhYeuXAyv4rMdUPaqI6rx0I4PQGAQ58PsdmIAhl68bfeI-Ee-7TaFvQz266h9dgIkUTJemYbCX5c2sSkI7NWkFSzY9yEZp9by6hpGljz-FCK2rXzK_3jyhb-Px3MCIfle5FrWWUgKuTJqPu1ciQp8UCO4wIjrbwmq5TpygcMFoRdCKRuRbtmQDpdnzUB0FCvbVQ6roPLz1T2Seic0GdPRd4FLFqcjiC5zHJ5BjQmA_Wy-f9XkBPerDBdwy81KG6WQJWsNtPI429GH5R9uteonD8P7ExYmhMaJYYu8u2gbWsaVRgoNyl9ESUhWmq_853rdw6P6YLyMGe_Yu43qsS-lSRbOdLwe9ESd0fDVIrecTCiqcJHTif-lwXFPS7l4fbmtbSvPH7N9Ynnt5kzTJdF9XYNGwtt2t7S6vIZWUgTO_hHDeQgf9Hq-hN0p-_vY4EOYOc3jL77O6tGi7BQzfWZGHhthWsXEdMvh88hHSMGG7lgEUxhBcKQYEloQCQL_T3RzsBacA3Wwu-URYFA6bk9AvopEFm_FTV6825Aj7l5DeppqYc3e6i0P6tRJZbaLvOh7u3zQgPTW_xMmAKeGh2_rf2sN--1l8b2RYuM-ljdTaH6b60-y-12FKXBI2aNPpwoXHfyxbdj2R0lgImjrsQHYIeZOJM0wEaSpOAUfPh9wFGuQ"
 
 # ─── STATE ───────────────────────────────────────────────────────────────────
@@ -48,6 +39,18 @@ def get_dates_to_check():
         d = today + timedelta(days=offset)
         dates.append(d.strftime("%Y-%m-%d"))
     return dates
+
+
+def parse_time(start_datetime):
+    """
+    Extract HH:MM from a datetime string like '2026-06-21T13:15:00+02:00'
+    The times are in Barcelona local time so we just read HH:MM directly.
+    """
+    try:
+        # Format: 2026-06-21T13:15:00+02:00 — take chars 11-16
+        return start_datetime[11:16]
+    except Exception:
+        return None
 
 
 def fetch_date(date_str):
@@ -69,33 +72,39 @@ def fetch_date(date_str):
     try:
         response = requests.get(CLORIAN_URL, params=params, headers=headers, timeout=10)
 
-        # 401/403 usually means the token expired
         if response.status_code in (401, 403):
             token_expired = True
-            print(f"  ⚠ Token may have expired (HTTP {response.status_code})")
+            print(f"  ⚠ Token expired (HTTP {response.status_code}) for {date_str}")
             return None
 
         response.raise_for_status()
         token_expired = False
-        data = response.json()
+        events = response.json()
 
-        events = data if isinstance(data, list) else (
-            data.get("events") or data.get("data") or data.get("items") or []
-        )
+        # API returns a list of event objects directly
+        if not isinstance(events, list):
+            events = events.get("events") or events.get("data") or events.get("items") or []
 
         tower = {t: 0 for t in TOWER_SLOTS}
         entry = {t: 0 for t in ENTRY_SLOTS}
 
         for event in events:
-            start = event.get("startDate") or event.get("start") or ""
-            if not start.startswith(date_str):
+            # Get the start datetime — field is 'startDatetime' per the response
+            start = (event.get("startDatetime") or
+                     event.get("startDate") or
+                     event.get("start") or "")
+
+            time_str = parse_time(start)
+            if not time_str:
                 continue
-            time_str = start[11:16]
-            avail = (
-                event.get("availableTickets") or
-                event.get("available") or
-                event.get("availability") or 0
-            )
+
+            # The key field is 'totalAvailability'
+            avail = (event.get("totalAvailability") or
+                     event.get("availableTickets") or
+                     event.get("available") or 0)
+
+            print(f"    {date_str} {time_str} → {avail} available")
+
             if time_str in TOWER_SLOTS:
                 tower[time_str] = avail
             if time_str in ENTRY_SLOTS:
@@ -122,7 +131,7 @@ def refresh_all():
             success += 1
         elif date_str in availability_cache:
             new_cache[date_str] = availability_cache[date_str]
-        time.sleep(0.4)  # be polite to the server
+        time.sleep(0.4)
 
     availability_cache = new_cache
     last_updated = datetime.now().isoformat()
